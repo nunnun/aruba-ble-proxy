@@ -76,6 +76,12 @@ If an Aruba access token is configured:
 aruba-ble-proxy-receiver --access-token "secret"
 ```
 
+The receiver accepts only the configured endpoint path (default
+`/aruba-ble-proxy`), bounds WebSocket messages and concurrent connections, and
+closes clients that repeatedly send invalid telemetry. The transport is still
+plain `ws://`; expose port `7443` only to trusted Aruba AP networks or protect it
+with equivalent firewall/VLAN controls.
+
 The CLI also reads environment variables:
 
 ```bash
@@ -138,7 +144,8 @@ Implemented:
 - `aruba_ble_proxy.generate_cli` service with response data
 - WebSocket receiver lifecycle inside Home Assistant
 - Aruba BLE advertisements converted to `BluetoothServiceInfoBleak`
-- Aruba APs registered as passive Home Assistant Bluetooth scanner sources when supported by HA
+- Aruba APs registered as active-scan Home Assistant Bluetooth sources, matching Aruba's background scan and scan-response forwarding
+- Aruba clusters may multiplex several AP scanner sources over one WebSocket; southbound actions remain routed by AP source
 - forwarding into Home Assistant Bluetooth via `async_get_advertisement_callback`
 - no recorder-backed diagnostic sensors; validation is done through Home Assistant Bluetooth sources and logs
 - connectable Home Assistant Bluetooth scanner support for active BLE/GATT

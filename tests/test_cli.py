@@ -6,6 +6,7 @@ def test_cli_reads_environment(monkeypatch):
     monkeypatch.setenv("ARUBA_BLE_PROXY_PORT", "17443")
     monkeypatch.setenv("ARUBA_BLE_PROXY_ACCESS_TOKEN", "secret")
     monkeypatch.setenv("ARUBA_BLE_PROXY_LOG_LEVEL", "debug")
+    monkeypatch.setenv("ARUBA_BLE_PROXY_ENDPOINT_PATH", "/telemetry")
 
     args = parse_args([])
 
@@ -13,6 +14,7 @@ def test_cli_reads_environment(monkeypatch):
     assert args.port == 17443
     assert args.access_token == "secret"
     assert args.log_level == "debug"
+    assert args.endpoint_path == "/telemetry"
 
 
 def test_cli_flags_override_environment(monkeypatch):

@@ -75,7 +75,11 @@ class ArubaBleRemoteScanner:
             source=source,
             name=scanner_name,
             connector=connector,
-            mode=BluetoothScanningMode.PASSIVE,
+            # Aruba APs actively scan in the background and forward both
+            # advertisement and scan-response frames. This mode describes
+            # scanning capability; GATT connectivity remains governed by the
+            # connector above.
+            mode=BluetoothScanningMode.ACTIVE,
         )
         self._scanner.name = scanner_name
         self._scanner.source = source

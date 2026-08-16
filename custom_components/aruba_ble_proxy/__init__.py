@@ -1,4 +1,6 @@
 import logging
+import re
+from urllib.parse import urlparse
 
 from .active import (
     ACTION_BLE_CONNECT,
@@ -16,6 +18,7 @@ from .aruba_cli import (
 from .const import (
     CONF_ACCESS_TOKEN,
     CONF_ACTIVE_CONNECTION_SLOTS,
+    CONF_AP_SOURCE,
     CONF_ENTRY_TYPE,
     CONF_ENABLE_ACTIVE_BLE,
     CONF_ENABLE_RADIO_PROFILE,
@@ -24,9 +27,11 @@ from .const import (
     CONF_LISTEN_PORT,
     CONF_PUBLIC_HOST,
     CONF_PUBLIC_SCHEME,
+    CONF_PARENT_ENTRY_ID,
     CONF_RADIO_PROFILE,
     CONF_TRANSPORT_PREFIX,
     DEFAULT_ACTIVE_CONNECTION_SLOTS,
+    DEFAULT_ENDPOINT_PATH,
     DOMAIN,
     ENTRY_TYPE_AP_SOURCE,
     SERVICE_BLE_CONNECT,
@@ -39,6 +44,7 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+_CLI_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 
 PLATFORMS: list[str] = []
 
@@ -54,13 +60,22 @@ async def async_setup_entry(hass, entry) -> bool:
         host=entry.data[CONF_LISTEN_HOST],
         port=entry.data[CONF_LISTEN_PORT],
         access_token=entry.data[CONF_ACCESS_TOKEN],
+        endpoint_path=entry.data.get(CONF_ENDPOINT_PATH, DEFAULT_ENDPOINT_PATH),
         enable_active_ble=entry.data.get(CONF_ENABLE_ACTIVE_BLE, True),
         active_connection_slots=entry.data.get(
             CONF_ACTIVE_CONNECTION_SLOTS,
             DEFAULT_ACTIVE_CONNECTION_SLOTS,
         ),
     )
-    await runtime.async_start(entry)
+    try:
+        await runtime.async_start(entry)
+    except OSError as err:
+        from homeassistant.exceptions import ConfigEntryNotReady
+
+        raise ConfigEntryNotReady(
+            f"Unable to bind Aruba BLE listener on "
+            f"{entry.data[CONF_LISTEN_HOST]}:{entry.data[CONF_LISTEN_PORT]}"
+        ) from err
     entry.runtime_data = runtime
     if PLATFORMS:
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
@@ -82,12 +97,33 @@ async def async_unload_entry(hass, entry) -> bool:
     return unload_ok
 
 
+async def async_remove_entry(hass, entry) -> None:
+    """Remove persistent Bluetooth data and child AP entries."""
+    if entry.data.get(CONF_ENTRY_TYPE) == ENTRY_TYPE_AP_SOURCE:
+        source = entry.data.get(CONF_AP_SOURCE)
+        if source:
+            from homeassistant.components.bluetooth import async_remove_scanner
+
+            async_remove_scanner(hass, str(source).upper())
+        return
+
+    child_entries = [
+        candidate
+        for candidate in hass.config_entries.async_entries(DOMAIN)
+        if candidate.data.get(CONF_ENTRY_TYPE) == ENTRY_TYPE_AP_SOURCE
+        and candidate.data.get(CONF_PARENT_ENTRY_ID) == entry.entry_id
+    ]
+    for child in child_entries:
+        await hass.config_entries.async_remove(child.entry_id)
+
+
 async def _async_update_listener(hass, entry) -> None:
     await hass.config_entries.async_reload(entry.entry_id)
 
 
 async def async_setup(hass, config: dict) -> bool:
     from homeassistant.core import SupportsResponse
+    from homeassistant.helpers.service import async_register_admin_service
 
     async def _async_generate_cli(call) -> dict[str, str]:
         data = _service_data_to_config(call.data)
@@ -158,49 +194,56 @@ async def async_setup(hass, config: dict) -> bool:
             wait_result=call.data["wait_result"],
         )
 
-    hass.services.async_register(
+    async_register_admin_service(
+        hass,
         DOMAIN,
         SERVICE_GENERATE_CLI,
         _async_generate_cli,
         schema=_cli_service_schema(),
         supports_response=SupportsResponse.ONLY,
     )
-    hass.services.async_register(
+    async_register_admin_service(
+        hass,
         DOMAIN,
         SERVICE_GENERATE_CLEANUP_CLI,
         _async_generate_cleanup_cli,
         schema=_cli_service_schema(),
         supports_response=SupportsResponse.ONLY,
     )
-    hass.services.async_register(
+    async_register_admin_service(
+        hass,
         DOMAIN,
         SERVICE_BLE_CONNECT,
         _async_ble_connect,
         schema=_ble_action_service_schema(),
         supports_response=SupportsResponse.ONLY,
     )
-    hass.services.async_register(
+    async_register_admin_service(
+        hass,
         DOMAIN,
         SERVICE_BLE_DISCONNECT,
         _async_ble_disconnect,
         schema=_ble_action_service_schema(),
         supports_response=SupportsResponse.ONLY,
     )
-    hass.services.async_register(
+    async_register_admin_service(
+        hass,
         DOMAIN,
         SERVICE_GATT_READ,
         _async_gatt_read,
         schema=_gatt_action_service_schema(include_value=False),
         supports_response=SupportsResponse.ONLY,
     )
-    hass.services.async_register(
+    async_register_admin_service(
+        hass,
         DOMAIN,
         SERVICE_GATT_WRITE,
         _async_gatt_write,
         schema=_gatt_action_service_schema(include_value=True),
         supports_response=SupportsResponse.ONLY,
     )
-    hass.services.async_register(
+    async_register_admin_service(
+        hass,
         DOMAIN,
         SERVICE_GATT_NOTIFY,
         _async_gatt_notify,
@@ -251,7 +294,10 @@ def _ble_action_service_schema():
         {
             vol.Required("ap_mac"): cv.matches_regex(_MAC_REGEX),
             vol.Required("device_mac"): cv.matches_regex(_MAC_REGEX),
-            vol.Optional("timeout", default=20): cv.positive_int,
+            vol.Optional("timeout", default=20): vol.All(
+                cv.positive_int,
+                vol.Range(max=300),
+            ),
             vol.Optional("wait_result", default=True): cv.boolean,
         }
     )
@@ -266,11 +312,14 @@ def _gatt_action_service_schema(*, include_value: bool):
         vol.Required("device_mac"): cv.matches_regex(_MAC_REGEX),
         vol.Required("service_uuid"): cv.matches_regex(_UUID_REGEX),
         vol.Required("characteristic_uuid"): cv.matches_regex(_UUID_REGEX),
-        vol.Optional("timeout", default=20): cv.positive_int,
+        vol.Optional("timeout", default=20): vol.All(
+            cv.positive_int,
+            vol.Range(max=300),
+        ),
         vol.Optional("wait_result", default=True): cv.boolean,
     }
     if include_value:
-        schema[vol.Required("value")] = cv.string
+        schema[vol.Required("value")] = vol.All(cv.string, vol.Length(max=4096))
         schema[vol.Optional("with_response", default=True)] = cv.boolean
     return vol.Schema(schema)
 
@@ -287,7 +336,10 @@ def _gatt_notify_service_schema():
             vol.Required("characteristic_uuid"): cv.matches_regex(_UUID_REGEX),
             vol.Optional("enable", default=True): cv.boolean,
             vol.Optional("indicate", default=False): cv.boolean,
-            vol.Optional("timeout", default=20): cv.positive_int,
+            vol.Optional("timeout", default=20): vol.All(
+                cv.positive_int,
+                vol.Range(max=300),
+            ),
             vol.Optional("wait_result", default=True): cv.boolean,
         }
     )
@@ -326,15 +378,89 @@ def _iter_runtimes(hass):
 
 def _service_data_to_config(data) -> dict:
     return {
-        CONF_PUBLIC_HOST: data[CONF_PUBLIC_HOST],
+        CONF_PUBLIC_HOST: _validate_service_public_host(data[CONF_PUBLIC_HOST]),
         CONF_PUBLIC_SCHEME: "ws",
-        CONF_LISTEN_PORT: data[CONF_LISTEN_PORT],
-        CONF_ENDPOINT_PATH: data[CONF_ENDPOINT_PATH],
-        CONF_ACCESS_TOKEN: data[CONF_ACCESS_TOKEN],
-        CONF_TRANSPORT_PREFIX: data[CONF_TRANSPORT_PREFIX],
+        CONF_LISTEN_PORT: _validate_service_port(data[CONF_LISTEN_PORT]),
+        CONF_ENDPOINT_PATH: _validate_service_endpoint_path(
+            data[CONF_ENDPOINT_PATH]
+        ),
+        CONF_ACCESS_TOKEN: _validate_service_token(data[CONF_ACCESS_TOKEN]),
+        CONF_TRANSPORT_PREFIX: _validate_service_cli_name(
+            data[CONF_TRANSPORT_PREFIX]
+        ),
         CONF_ENABLE_RADIO_PROFILE: data[CONF_ENABLE_RADIO_PROFILE],
-        CONF_RADIO_PROFILE: data[CONF_RADIO_PROFILE],
+        CONF_RADIO_PROFILE: _validate_service_cli_name(data[CONF_RADIO_PROFILE]),
     }
+
+
+def _validate_service_port(value) -> int:
+    if isinstance(value, bool):
+        raise ValueError("port must be an integer")
+    port = int(value)
+    if not 1 <= port <= 65535:
+        raise ValueError("port must be between 1 and 65535")
+    return port
+
+
+def _validate_service_public_host(value) -> str:
+    host = str(value).strip().rstrip("/")
+    if not host or _has_unsafe_cli_characters(host):
+        raise ValueError("public host is invalid")
+    try:
+        parsed = urlparse(host if "://" in host else f"//{host}")
+    except ValueError as err:
+        raise ValueError("invalid public host") from err
+    if parsed.scheme and parsed.scheme not in {"http", "https", "ws", "wss"}:
+        raise ValueError("unsupported public host scheme")
+    if (
+        not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("public host must not contain a path, query, or fragment")
+    try:
+        parsed.port
+    except ValueError as err:
+        raise ValueError("invalid public host port") from err
+    return host
+
+
+def _validate_service_endpoint_path(value) -> str:
+    path = str(value).strip() or "/aruba-ble-proxy"
+    if not path.startswith("/"):
+        path = f"/{path}"
+    if (
+        len(path) > 128
+        or _has_unsafe_cli_characters(path)
+        or "?" in path
+        or "#" in path
+    ):
+        raise ValueError("endpoint path is invalid")
+    return path
+
+
+def _validate_service_token(value) -> str:
+    token = str(value).strip()
+    if not token or len(token) > 512 or _has_unsafe_cli_characters(token):
+        raise ValueError("access token is invalid")
+    return token
+
+
+def _validate_service_cli_name(value) -> str:
+    name = str(value).strip()
+    if not _CLI_NAME_RE.fullmatch(name):
+        raise ValueError("profile name is invalid")
+    return name
+
+
+def _has_unsafe_cli_characters(value: str) -> bool:
+    return any(
+        character.isspace() or ord(character) < 32 or ord(character) == 127
+        for character in value
+    )
 
 
 def _parse_hex_value(value: str) -> bytes:
@@ -366,7 +492,12 @@ def _endpoint_url(data: dict) -> str:
     for prefix in ("http://", "https://", "ws://", "wss://"):
         if host.startswith(prefix):
             host = host.removeprefix(prefix)
-    if ":" not in host.rsplit("/", 1)[0]:
+    host_part = host.split("/", 1)[0]
+    if host_part.startswith("[") and "]" in host_part:
+        has_port = host_part.rindex("]") < len(host_part) - 1
+    else:
+        has_port = ":" in host_part
+    if not has_port:
         host = f"{host}:{data[CONF_LISTEN_PORT]}"
     path = str(data[CONF_ENDPOINT_PATH]).strip() or "/aruba-ble-proxy"
     if not path.startswith("/"):

@@ -25,6 +25,7 @@ from .const import (
     CONF_AP_SOURCE,
     CONF_ENTRY_TYPE,
     CONF_PARENT_ENTRY_ID,
+    DEFAULT_ENDPOINT_PATH,
     DOMAIN,
     ENTRY_TYPE_AP_SOURCE,
 )
@@ -50,6 +51,7 @@ DISCONNECT_SUCCESS_STATUSES = {
 PASSIVE_SENSOR_UPDATE_INTERVAL = 30.0
 RUNTIME_STATS_SET_LIMIT = 2048
 DEVICE_ADVERTISED_SERVICE_UUIDS_LIMIT = 4096
+CANCELLED_ACTION_IDS_LIMIT = 4096
 
 
 @dataclass
@@ -217,6 +219,7 @@ class ArubaBleProxyRuntime:
         host: str,
         port: int,
         access_token: str,
+        endpoint_path: str = DEFAULT_ENDPOINT_PATH,
         enable_active_ble: bool = True,
         active_connection_slots: int = 1,
     ) -> None:
@@ -224,6 +227,7 @@ class ArubaBleProxyRuntime:
         self.host = host
         self.port = port
         self.access_token = access_token
+        self.endpoint_path = endpoint_path
         self.enable_active_ble = enable_active_ble
         self.active_connection_slots = max(1, int(active_connection_slots))
         self.stats = RuntimeStats()
@@ -231,6 +235,7 @@ class ArubaBleProxyRuntime:
             host=host,
             port=port,
             access_token=access_token,
+            endpoint_path=endpoint_path,
             event_handler=self._async_handle_event,
             message_handler=self._async_handle_message,
             source_disconnect_handler=self._handle_source_disconnect,
@@ -957,7 +962,7 @@ class ArubaBleProxyRuntime:
             if future is not None:
                 self._pending_actions.pop(request.action_id or "", None)
                 context = self._pending_action_contexts.pop(request.action_id or "", None)
-                self._cancelled_action_ids.add(request.action_id or "")
+                self._remember_cancelled_action_id(request.action_id)
             self._record_active_action_duration(
                 action_type=request.action_type,
                 status="send_error",
@@ -993,7 +998,7 @@ class ArubaBleProxyRuntime:
         except asyncio.CancelledError:
             self._pending_actions.pop(request.action_id or "", None)
             context = self._pending_action_contexts.pop(request.action_id or "", None)
-            self._cancelled_action_ids.add(request.action_id or "")
+            self._remember_cancelled_action_id(request.action_id)
             future.cancel()
             self._record_active_action_duration(
                 action_type=request.action_type,
@@ -1008,7 +1013,7 @@ class ArubaBleProxyRuntime:
         except TimeoutError:
             self._pending_actions.pop(request.action_id or "", None)
             context = self._pending_action_contexts.pop(request.action_id or "", None)
-            self._cancelled_action_ids.add(request.action_id or "")
+            self._remember_cancelled_action_id(request.action_id)
             self._record_active_action_duration(
                 action_type=request.action_type,
                 status="timeout_waiting_for_action_result",
@@ -1032,6 +1037,13 @@ class ArubaBleProxyRuntime:
             "apb_mac": result.apb_mac,
         }
         return response
+
+    def _remember_cancelled_action_id(self, action_id: str | None) -> None:
+        if not action_id:
+            return
+        if len(self._cancelled_action_ids) >= CANCELLED_ACTION_IDS_LIMIT:
+            self._cancelled_action_ids.pop()
+        self._cancelled_action_ids.add(action_id)
 
     async def async_gatt_write(
         self,
@@ -1650,6 +1662,7 @@ class ArubaBleProxyRuntime:
             {
                 "listen_host": self.host,
                 "listen_port": self.port,
+                "endpoint_path": self.endpoint_path,
                 "active_ble_enabled": self.enable_active_ble,
                 "active_connection_slots_per_ap": self.active_connection_slots,
                 "registered_scanners": len(self._remote_scanners),
@@ -1661,6 +1674,26 @@ class ArubaBleProxyRuntime:
                 "receiver_text_messages": receiver_stats.text_messages,
                 "receiver_invalid_tokens": receiver_stats.invalid_tokens,
                 "receiver_decode_errors": receiver_stats.decode_errors,
+                "receiver_rejected_connections": getattr(
+                    receiver_stats,
+                    "rejected_connections",
+                    0,
+                ),
+                "receiver_rejected_paths": getattr(
+                    receiver_stats,
+                    "rejected_paths",
+                    0,
+                ),
+                "receiver_rejected_sources": getattr(
+                    receiver_stats,
+                    "rejected_sources",
+                    0,
+                ),
+                "receiver_source_replacements": getattr(
+                    receiver_stats,
+                    "source_replacements",
+                    0,
+                ),
                 "receiver_last_peer": receiver_stats.last_peer,
                 "receiver_running": self._task is not None and not self._task.done(),
                 "active_operation_locks": len(self._active_operation_slots),
@@ -1842,18 +1875,30 @@ class ArubaBleProxyRuntime:
             runtime=self,
             connectable=self.enable_active_ble,
         )
-        unsubs = [
-            self._register_scanner(
-                self.hass,
-                remote_scanner.scanner,
-                connection_slots=(
-                    self.active_connection_slots if remote_scanner.connectable else 0
-                ),
-                source_domain=DOMAIN,
-                source_config_entry_id=source_config_entry_id,
-            ),
-            remote_scanner.async_setup(),
-        ]
+        unsubs = []
+        try:
+            unsubs.append(
+                self._register_scanner(
+                    self.hass,
+                    remote_scanner.scanner,
+                    connection_slots=(
+                        self.active_connection_slots if remote_scanner.connectable else 0
+                    ),
+                    source_domain=DOMAIN,
+                    source_config_entry_id=source_config_entry_id,
+                )
+            )
+            unsubs.append(remote_scanner.async_setup())
+        except Exception:
+            for unsubscribe in reversed(unsubs):
+                try:
+                    unsubscribe()
+                except Exception:
+                    _LOGGER.exception(
+                        "Failed to roll back Aruba scanner registration for %s",
+                        source,
+                    )
+            raise
         self._remote_scanners[source] = remote_scanner
         self._scanner_unsubs[source] = unsubs
         self.stats.active_connectable_scanners = sum(
@@ -1867,9 +1912,12 @@ class ArubaBleProxyRuntime:
         return remote_scanner
 
     def _unregister_scanners(self) -> None:
-        for callbacks in list(self._scanner_unsubs.values()):
-            for unsubscribe in callbacks:
-                unsubscribe()
+        for source, callbacks in list(self._scanner_unsubs.items()):
+            for unsubscribe in reversed(callbacks):
+                try:
+                    unsubscribe()
+                except Exception:
+                    _LOGGER.exception("Failed to unregister Aruba scanner %s", source)
         self._scanner_unsubs.clear()
         self._remote_scanners.clear()
         self.stats.active_connectable_scanners = 0

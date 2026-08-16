@@ -38,9 +38,17 @@
     },
     "abort": {
       "already_configured": "This Aruba BLE Proxy listener is already configured."
+    },
+    "error": {
+      "cannot_bind": "The selected listener port is already in use or cannot be opened.",
+      "invalid_input": "One or more configuration values are invalid. Check the host, endpoint path, token, profile names, port, and active connection slots."
     }
   },
   "options": {
+    "error": {
+      "cannot_bind": "The selected listener port is already in use or cannot be opened.",
+      "invalid_input": "One or more configuration values are invalid. Check the host, endpoint path, token, profile names, port, and active connection slots."
+    },
     "step": {
       "init": {
         "title": "Configure Aruba BLE Proxy",

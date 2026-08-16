@@ -37,7 +37,7 @@ def _install_fake_bluetooth(monkeypatch, scanner_base):
 
     bluetooth = types.ModuleType("homeassistant.components.bluetooth")
     bluetooth.BaseHaRemoteScanner = scanner_base
-    bluetooth.BluetoothScanningMode = SimpleNamespace(PASSIVE="passive")
+    bluetooth.BluetoothScanningMode = SimpleNamespace(ACTIVE="active")
     bluetooth.HaBluetoothConnector = HaBluetoothConnector
 
     components = types.ModuleType("homeassistant.components")
@@ -58,6 +58,8 @@ def test_remote_scanner_forwards_payload_to_legacy_internal_method(monkeypatch):
             self.connectable = kwargs["connectable"]
             self.scanner_id = kwargs["scanner_id"]
             self.name = kwargs["name"]
+            self.requested_mode = kwargs["requested_mode"]
+            self.current_mode = kwargs["current_mode"]
             self.details = _Details()
 
         def async_setup(self):
@@ -76,6 +78,8 @@ def test_remote_scanner_forwards_payload_to_legacy_internal_method(monkeypatch):
     assert scanner.scanner.source == "02:00:00:00:00:01"
     assert scanner.scanner.adapter == "02:00:00:00:00:01"
     assert scanner.scanner.details.name == "Aruba AP 02:00:00:00:00:01"
+    assert scanner.scanner.requested_mode == "active"
+    assert scanner.scanner.current_mode == "active"
     assert LegacyScanner.calls == [
         (
             "02:00:00:00:01:01",

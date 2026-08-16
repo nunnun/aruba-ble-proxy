@@ -66,6 +66,10 @@ Home Assistant Bleak client
 - A generated or user-provided access token.
 - Aruba APs are discovered automatically when they connect.
 - Every Aruba `reporter.mac` is treated as a separate Bluetooth scanner source.
+- Scanner mode is reported to Home Assistant as active because Aruba collects
+  advertisement and scan-response frames in its background BLE scan.
+- A cluster transport WebSocket may carry reports for multiple `reporter.mac`
+  sources; they must remain independently routable over the shared connection.
 - BLE advertisements are passed through without semantic device interpretation.
 - Active BLE can be enabled or disabled from integration options.
 - Active connection slots per AP are configurable and enforced locally before
@@ -91,13 +95,16 @@ unfiltered BLE traffic by itself.
 - Use constant-time token comparison.
 - Never log token values.
 - If no token is configured, run in explicitly insecure mode and log that state.
+- Enforce the configured WebSocket endpoint path.
+- Bound message queues, message size, and simultaneous connections.
+- Close connections that repeatedly send invalid telemetry.
 
 Potential future controls:
 
 - IP/subnet allowlist for APs.
 - TLS / `wss://`.
 - token rotation.
-- rate limiting failed connections.
+- per-IP rate limiting and backoff.
 
 ## GATT Discovery Contract
 

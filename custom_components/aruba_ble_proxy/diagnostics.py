@@ -6,14 +6,12 @@ from .const import CONF_ACCESS_TOKEN, CONF_ENTRY_TYPE, DOMAIN, ENTRY_TYPE_AP_SOU
 
 
 async def async_get_config_entry_diagnostics(hass, entry) -> dict[str, Any]:
-    redacted_data = dict(entry.data)
-    if CONF_ACCESS_TOKEN in redacted_data:
-        redacted_data[CONF_ACCESS_TOKEN] = "***redacted***"
+    redacted_data = _redact_credentials(entry.data)
 
     payload: dict[str, Any] = {
         "domain": DOMAIN,
         "entry": redacted_data,
-        "options": dict(entry.options),
+        "options": _redact_credentials(entry.options),
     }
     if entry.data.get(CONF_ENTRY_TYPE) == ENTRY_TYPE_AP_SOURCE:
         payload["runtime"] = None
@@ -31,3 +29,9 @@ async def async_get_config_entry_diagnostics(hass, entry) -> dict[str, Any]:
     payload["runtime"] = runtime_payload
     return payload
 
+
+def _redact_credentials(data) -> dict[str, Any]:
+    redacted = dict(data)
+    if CONF_ACCESS_TOKEN in redacted:
+        redacted[CONF_ACCESS_TOKEN] = "***redacted***"
+    return redacted

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import re
 import secrets
 from typing import Any
 from urllib.parse import urlparse
@@ -15,6 +17,8 @@ from .aruba_cli import (
 )
 
 _uuid_cache: list[str] | None = None
+MAX_ACTIVE_CONNECTION_SLOTS = 32
+_CLI_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 
 
 def _cached_uuid_list() -> list[str]:
@@ -57,16 +61,159 @@ from .const import (
 
 
 def _default_public_host(hass) -> str:
-    url = getattr(hass.config, "internal_url", None) or getattr(hass.config, "external_url", None) or ""
+    url = (
+        getattr(hass.config, "internal_url", None)
+        or getattr(hass.config, "external_url", None)
+        or ""
+    )
     if not url:
         return ""
     parsed = urlparse(url)
-    return parsed.hostname or url
+    host = parsed.hostname or url
+    return f"[{host}]" if ":" in host and not host.startswith("[") else host
 
 
 def _clean_path(path: str) -> str:
     path = path.strip() or DEFAULT_ENDPOINT_PATH
     return path if path.startswith("/") else f"/{path}"
+
+
+def _validate_listen_port(value: Any) -> int:
+    if isinstance(value, bool):
+        raise vol.Invalid("port must be an integer")
+    try:
+        port = int(value)
+    except (TypeError, ValueError) as err:
+        raise vol.Invalid("port must be an integer") from err
+    if not 1 <= port <= 65535:
+        raise vol.Invalid("port must be between 1 and 65535")
+    return port
+
+
+def _validate_active_connection_slots(value: Any) -> int:
+    if isinstance(value, bool):
+        raise vol.Invalid("active connection slots must be an integer")
+    try:
+        slots = int(value)
+    except (TypeError, ValueError) as err:
+        raise vol.Invalid("active connection slots must be an integer") from err
+    if not 1 <= slots <= MAX_ACTIVE_CONNECTION_SLOTS:
+        raise vol.Invalid(
+            f"active connection slots must be between 1 and {MAX_ACTIVE_CONNECTION_SLOTS}"
+        )
+    return slots
+
+
+def _validate_public_host(value: Any) -> str:
+    host = str(value).strip().rstrip("/")
+    if not host or _has_unsafe_cli_characters(host):
+        raise vol.Invalid("public host is required")
+    try:
+        parsed = urlparse(host if "://" in host else f"//{host}")
+    except ValueError as err:
+        raise vol.Invalid("invalid public host") from err
+    if parsed.scheme and parsed.scheme not in {"http", "https", "ws", "wss"}:
+        raise vol.Invalid("unsupported public host scheme")
+    if (
+        not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise vol.Invalid("public host must not contain a path, query, or fragment")
+    try:
+        parsed.port
+    except ValueError as err:
+        raise vol.Invalid("invalid public host port") from err
+    return host
+
+
+def _validate_endpoint_path(value: Any) -> str:
+    path = _clean_path(str(value))
+    if (
+        len(path) > 128
+        or _has_unsafe_cli_characters(path)
+        or "?" in path
+        or "#" in path
+    ):
+        raise vol.Invalid("endpoint path is invalid")
+    return path
+
+
+def _validate_cli_name(value: Any) -> str:
+    name = str(value).strip()
+    if not _CLI_NAME_RE.fullmatch(name):
+        raise vol.Invalid("profile names may contain only letters, digits, dot, dash, underscore")
+    return name
+
+
+def _validate_access_token(value: Any) -> str:
+    token = str(value).strip()
+    if len(token) > 512 or _has_unsafe_cli_characters(token):
+        raise vol.Invalid("access token is invalid")
+    return token
+
+
+def _has_unsafe_cli_characters(value: str) -> bool:
+    return any(
+        character.isspace() or ord(character) < 32 or ord(character) == 127
+        for character in value
+    )
+
+
+def _listener_data_schema(defaults: dict[str, Any]) -> vol.Schema:
+    return vol.Schema(
+        {
+            vol.Required(
+                CONF_LISTEN_PORT,
+                default=defaults[CONF_LISTEN_PORT],
+            ): int,
+            vol.Required(
+                CONF_PUBLIC_HOST,
+                default=defaults[CONF_PUBLIC_HOST],
+            ): str,
+            vol.Required(
+                CONF_ENDPOINT_PATH,
+                default=defaults[CONF_ENDPOINT_PATH],
+            ): str,
+            vol.Optional(
+                CONF_ACCESS_TOKEN,
+                default=defaults[CONF_ACCESS_TOKEN],
+            ): str,
+            vol.Required(
+                CONF_TRANSPORT_PREFIX,
+                default=defaults[CONF_TRANSPORT_PREFIX],
+            ): str,
+            vol.Required(
+                CONF_ENABLE_RADIO_PROFILE,
+                default=defaults[CONF_ENABLE_RADIO_PROFILE],
+            ): bool,
+            vol.Required(
+                CONF_ENABLE_ACTIVE_BLE,
+                default=defaults[CONF_ENABLE_ACTIVE_BLE],
+            ): bool,
+            vol.Required(
+                CONF_ACTIVE_CONNECTION_SLOTS,
+                default=defaults[CONF_ACTIVE_CONNECTION_SLOTS],
+            ): int,
+            vol.Required(
+                CONF_RADIO_PROFILE,
+                default=defaults[CONF_RADIO_PROFILE],
+            ): str,
+        }
+    )
+
+
+async def _async_test_bind_port(host: str, port: int) -> None:
+    server = await asyncio.start_server(_close_probe_connection, host, port)
+    server.close()
+    await server.wait_closed()
+
+
+def _close_probe_connection(reader, writer) -> None:
+    writer.close()
 
 
 def _endpoint_url(data: dict[str, Any]) -> str:
@@ -157,12 +304,37 @@ def _data_with_defaults(data: dict[str, Any]) -> dict[str, Any]:
         CONF_SETUP_COMPLETE: False,
     }
     merged.update(data)
-    merged[CONF_ENDPOINT_PATH] = _clean_path(str(merged[CONF_ENDPOINT_PATH]))
-    merged[CONF_ACTIVE_CONNECTION_SLOTS] = max(
-        1,
-        int(merged[CONF_ACTIVE_CONNECTION_SLOTS]),
+    merged[CONF_LISTEN_PORT] = _validate_listen_port(merged[CONF_LISTEN_PORT])
+    merged[CONF_ENDPOINT_PATH] = _validate_endpoint_path(merged[CONF_ENDPOINT_PATH])
+    merged[CONF_ACTIVE_CONNECTION_SLOTS] = _validate_active_connection_slots(
+        merged[CONF_ACTIVE_CONNECTION_SLOTS]
     )
     return merged
+
+
+def _validate_listener_data(data: dict[str, Any]) -> dict[str, Any]:
+    """Normalize submitted data with validators kept outside the UI schema.
+
+    Home Assistant must serialize config-flow schemas for the frontend. Plain
+    Python validator functions aren't serializable by voluptuous-serialize.
+    """
+    validated = _data_with_defaults(data)
+    validated[CONF_PUBLIC_HOST] = _validate_public_host(
+        validated[CONF_PUBLIC_HOST]
+    )
+    validated[CONF_ENDPOINT_PATH] = _validate_endpoint_path(
+        validated[CONF_ENDPOINT_PATH]
+    )
+    validated[CONF_ACCESS_TOKEN] = _validate_access_token(
+        validated[CONF_ACCESS_TOKEN]
+    )
+    validated[CONF_TRANSPORT_PREFIX] = _validate_cli_name(
+        validated[CONF_TRANSPORT_PREFIX]
+    )
+    validated[CONF_RADIO_PROFILE] = _validate_cli_name(
+        validated[CONF_RADIO_PROFILE]
+    )
+    return validated
 
 
 class ArubaBleProxyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -191,12 +363,29 @@ class ArubaBleProxyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     async def async_step_user(self, user_input: dict[str, Any] | None = None):
         if user_input is not None:
-            data = _data_with_defaults(dict(user_input))
+            try:
+                data = _validate_listener_data(dict(user_input))
+            except vol.Invalid:
+                return self.async_show_form(
+                    step_id="user",
+                    data_schema=_listener_data_schema(
+                        {**_data_with_defaults({}), **dict(user_input)}
+                    ),
+                    errors={"base": "invalid_input"},
+                )
             data[CONF_LISTEN_HOST] = DEFAULT_LISTEN_HOST
             data[CONF_PUBLIC_SCHEME] = DEFAULT_PUBLIC_SCHEME
             data[CONF_ACCESS_TOKEN] = data[CONF_ACCESS_TOKEN].strip() or secrets.token_urlsafe(32)
             data[CONF_ENTRY_TYPE] = ENTRY_TYPE_LISTENER
             data[CONF_SETUP_COMPLETE] = True
+            try:
+                await _async_test_bind_port(data[CONF_LISTEN_HOST], data[CONF_LISTEN_PORT])
+            except OSError:
+                return self.async_show_form(
+                    step_id="user",
+                    data_schema=_listener_data_schema(data),
+                    errors={"base": "cannot_bind"},
+                )
             self._data = data
             await self.async_set_unique_id(f"{data[CONF_LISTEN_HOST]}:{data[CONF_LISTEN_PORT]}")
             self._abort_if_unique_id_configured()
@@ -204,21 +393,10 @@ class ArubaBleProxyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="user",
-            data_schema=vol.Schema(
-                {
-                    vol.Required(CONF_LISTEN_PORT, default=DEFAULT_LISTEN_PORT): int,
-                    vol.Required(CONF_PUBLIC_HOST, default=_default_public_host(self.hass)): str,
-                    vol.Required(CONF_ENDPOINT_PATH, default=DEFAULT_ENDPOINT_PATH): str,
-                    vol.Optional(CONF_ACCESS_TOKEN, default=""): str,
-                    vol.Required(CONF_TRANSPORT_PREFIX, default=DEFAULT_TRANSPORT_PREFIX): str,
-                    vol.Required(CONF_ENABLE_RADIO_PROFILE, default=True): bool,
-                    vol.Required(CONF_ENABLE_ACTIVE_BLE, default=DEFAULT_ENABLE_ACTIVE_BLE): bool,
-                    vol.Required(
-                        CONF_ACTIVE_CONNECTION_SLOTS,
-                        default=DEFAULT_ACTIVE_CONNECTION_SLOTS,
-                    ): int,
-                    vol.Required(CONF_RADIO_PROFILE, default=DEFAULT_RADIO_PROFILE): str,
-                }
+            data_schema=_listener_data_schema(
+                _data_with_defaults(
+                    {CONF_PUBLIC_HOST: _default_public_host(self.hass)}
+                )
             ),
         )
 
@@ -254,34 +432,41 @@ class ArubaBleProxyOptionsFlow(config_entries.OptionsFlow):
         if user_input is not None:
             data = _data_with_defaults(dict(self.config_entry.data))
             data.update(dict(user_input))
+            try:
+                data = _validate_listener_data(data)
+            except vol.Invalid:
+                return self.async_show_form(
+                    step_id="init",
+                    data_schema=_listener_data_schema(data),
+                    errors={"base": "invalid_input"},
+                )
             data[CONF_LISTEN_HOST] = DEFAULT_LISTEN_HOST
             data[CONF_PUBLIC_SCHEME] = DEFAULT_PUBLIC_SCHEME
             data[CONF_ENDPOINT_PATH] = _clean_path(str(data[CONF_ENDPOINT_PATH]))
-            data[CONF_ACCESS_TOKEN] = str(data[CONF_ACCESS_TOKEN]).strip() or secrets.token_urlsafe(32)
+            data[CONF_ACCESS_TOKEN] = (
+                str(data[CONF_ACCESS_TOKEN]).strip() or secrets.token_urlsafe(32)
+            )
             data[CONF_ENTRY_TYPE] = ENTRY_TYPE_LISTENER
             data[CONF_SETUP_COMPLETE] = True
+            if data[CONF_LISTEN_PORT] != self.config_entry.data.get(CONF_LISTEN_PORT):
+                try:
+                    await _async_test_bind_port(
+                        data[CONF_LISTEN_HOST],
+                        data[CONF_LISTEN_PORT],
+                    )
+                except OSError:
+                    return self.async_show_form(
+                        step_id="init",
+                        data_schema=_listener_data_schema(data),
+                        errors={"base": "cannot_bind"},
+                    )
             self._data = data
             return await self.async_step_cli()
 
         data = _data_with_defaults(dict(self.config_entry.data))
         return self.async_show_form(
             step_id="init",
-            data_schema=vol.Schema(
-                {
-                    vol.Required(CONF_LISTEN_PORT, default=data[CONF_LISTEN_PORT]): int,
-                    vol.Required(CONF_PUBLIC_HOST, default=data[CONF_PUBLIC_HOST]): str,
-                    vol.Required(CONF_ENDPOINT_PATH, default=data[CONF_ENDPOINT_PATH]): str,
-                    vol.Optional(CONF_ACCESS_TOKEN, default=data[CONF_ACCESS_TOKEN]): str,
-                    vol.Required(CONF_TRANSPORT_PREFIX, default=data[CONF_TRANSPORT_PREFIX]): str,
-                    vol.Required(CONF_ENABLE_RADIO_PROFILE, default=data[CONF_ENABLE_RADIO_PROFILE]): bool,
-                    vol.Required(CONF_ENABLE_ACTIVE_BLE, default=data[CONF_ENABLE_ACTIVE_BLE]): bool,
-                    vol.Required(
-                        CONF_ACTIVE_CONNECTION_SLOTS,
-                        default=data[CONF_ACTIVE_CONNECTION_SLOTS],
-                    ): int,
-                    vol.Required(CONF_RADIO_PROFILE, default=data[CONF_RADIO_PROFILE]): str,
-                }
-            ),
+            data_schema=_listener_data_schema(data),
         )
 
     async def async_step_cli(self, user_input: dict[str, Any] | None = None):

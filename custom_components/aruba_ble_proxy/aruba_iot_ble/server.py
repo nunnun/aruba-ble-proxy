@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
@@ -17,6 +18,14 @@ EventHandler = Callable[[ArubaBleEvent], Awaitable[None]]
 MessageHandler = Callable[[ArubaTelemetryMessage], Awaitable[None]]
 SourceDisconnectHandler = Callable[[str], None]
 SEND_TIMEOUT = 2.0
+MAX_MESSAGE_SIZE = 1024 * 1024
+MAX_MESSAGE_QUEUE = 16
+MAX_CONNECTIONS = 128
+MAX_SOURCES = 1024
+MAX_DECODE_ERRORS = 3
+MAX_TEXT_MESSAGES = 3
+DEFAULT_ENDPOINT_PATH = "/aruba-ble-proxy"
+_MAC_RE = re.compile(r"^[0-9A-F]{2}(?::[0-9A-F]{2}){5}$")
 
 
 @dataclass
@@ -27,6 +36,10 @@ class ReceiverStats:
     text_messages: int = 0
     invalid_tokens: int = 0
     decode_errors: int = 0
+    rejected_connections: int = 0
+    rejected_paths: int = 0
+    rejected_sources: int = 0
+    source_replacements: int = 0
     last_peer: str | None = None
 
 
@@ -36,6 +49,7 @@ class ArubaBleReceiver:
         host: str = "0.0.0.0",
         port: int = 7443,
         access_token: str | None = None,
+        endpoint_path: str = DEFAULT_ENDPOINT_PATH,
         event_handler: EventHandler | None = None,
         message_handler: MessageHandler | None = None,
         source_disconnect_handler: SourceDisconnectHandler | None = None,
@@ -43,17 +57,29 @@ class ArubaBleReceiver:
         self.host = host
         self.port = port
         self.decoder = ArubaTelemetryDecoder(access_token=access_token)
+        self.endpoint_path = _normalize_endpoint_path(endpoint_path)
         self.event_handler = event_handler or log_event
         self.message_handler = message_handler
         self.source_disconnect_handler = source_disconnect_handler
         self.stats = ReceiverStats()
         self._connections_by_source: dict[str, object] = {}
+        # Aruba clusters may multiplex reports from several AP radios over one
+        # transport WebSocket. Keep every reporter source associated with the
+        # physical connection so southbound actions can be routed back through
+        # that same socket.
         self._sources_by_connection: dict[int, set[str]] = {}
+        self._active_connections: set[int] = set()
         self._send_locks: dict[str, asyncio.Lock] = {}
 
     async def run(self) -> None:
         LOGGER.info("Starting Aruba BLE receiver on %s:%s", self.host, self.port)
-        async with serve(self._handle_connection, self.host, self.port):
+        async with serve(
+            self._handle_connection,
+            self.host,
+            self.port,
+            max_size=MAX_MESSAGE_SIZE,
+            max_queue=MAX_MESSAGE_QUEUE,
+        ):
             await asyncio.Future()
 
     async def _handle_connection(self, websocket) -> None:
@@ -61,14 +87,35 @@ class ArubaBleReceiver:
         peer_name = _peer_name(peer)
         self.stats.connections_opened += 1
         self.stats.last_peer = peer_name
+        connection_id = id(websocket)
+        if len(self._active_connections) >= MAX_CONNECTIONS:
+            self.stats.rejected_connections += 1
+            await websocket.close(code=1013, reason="connection limit reached")
+            self.stats.connections_closed += 1
+            return
+        self._active_connections.add(connection_id)
+
+        request_path = _websocket_request_path(websocket)
+        if request_path is not None and request_path != self.endpoint_path:
+            self.stats.rejected_paths += 1
+            await websocket.close(code=1008, reason="invalid endpoint path")
+            self._active_connections.discard(connection_id)
+            self.stats.connections_closed += 1
+            return
         LOGGER.info("Aruba WebSocket connected: %s", peer)
 
+        connection_decode_errors = 0
+        connection_text_messages = 0
         try:
             try:
                 async for message in websocket:
                     if isinstance(message, str):
                         self.stats.text_messages += 1
+                        connection_text_messages += 1
                         LOGGER.debug("Ignoring text WebSocket message from %s: %s", peer, message)
+                        if connection_text_messages >= MAX_TEXT_MESSAGES:
+                            await websocket.close(code=1003, reason="binary telemetry required")
+                            return
                         continue
 
                     self.stats.binary_messages += 1
@@ -81,10 +128,26 @@ class ArubaBleReceiver:
                         return
                     except Exception:
                         self.stats.decode_errors += 1
-                        LOGGER.exception("Failed to decode Aruba telemetry from %s", peer)
+                        connection_decode_errors += 1
+                        if connection_decode_errors == 1:
+                            LOGGER.exception("Failed to decode Aruba telemetry from %s", peer)
+                        else:
+                            LOGGER.warning(
+                                "Repeated invalid Aruba telemetry from %s (%d/%d)",
+                                peer,
+                                connection_decode_errors,
+                                MAX_DECODE_ERRORS,
+                            )
+                        if connection_decode_errors >= MAX_DECODE_ERRORS:
+                            await websocket.close(code=1008, reason="invalid telemetry")
+                            return
                         continue
 
-                    self._track_connection_source(websocket, decoded.reporter.source)
+                    if not await self._bind_connection_source(
+                        websocket,
+                        decoded.reporter.source,
+                    ):
+                        return
                     if self.message_handler is not None:
                         await self.message_handler(decoded)
                     for event in decoded.events:
@@ -93,6 +156,7 @@ class ArubaBleReceiver:
                 LOGGER.info("Aruba WebSocket closed from %s: %s", peer, err)
         finally:
             disconnected_sources = self._forget_connection(websocket)
+            self._active_connections.discard(connection_id)
             for source in disconnected_sources:
                 self._notify_source_disconnected(source)
             self.stats.connections_closed += 1
@@ -113,19 +177,41 @@ class ArubaBleReceiver:
     def connected_sources(self) -> list[str]:
         return sorted(self._connections_by_source)
 
-    def _track_connection_source(self, websocket, source: str) -> None:
-        normalized_source = source.upper()
+    async def _bind_connection_source(self, websocket, source: str) -> bool:
+        normalized_source = _normalize_source(source)
+        if normalized_source is None:
+            await websocket.close(code=1008, reason="invalid reporter source")
+            return False
+
+        connection_id = id(websocket)
+        previous = self._connections_by_source.get(normalized_source)
+        if previous is None and len(self._connections_by_source) >= MAX_SOURCES:
+            self.stats.rejected_sources += 1
+            await websocket.close(code=1013, reason="source limit reached")
+            return False
+        if previous is not None and previous is not websocket:
+            self.stats.source_replacements += 1
+            previous_sources = self._sources_by_connection.get(id(previous))
+            if previous_sources is not None:
+                previous_sources.discard(normalized_source)
+                if not previous_sources:
+                    self._sources_by_connection.pop(id(previous), None)
+
         self._connections_by_source[normalized_source] = websocket
-        self._sources_by_connection.setdefault(id(websocket), set()).add(normalized_source)
+        self._sources_by_connection.setdefault(connection_id, set()).add(
+            normalized_source
+        )
+        return True
 
     def _forget_connection(self, websocket) -> list[str]:
         disconnected_sources = []
         sources = self._sources_by_connection.pop(id(websocket), set())
         for source in sources:
-            if self._connections_by_source.get(source) is websocket:
-                self._connections_by_source.pop(source, None)
-                self._send_locks.pop(source, None)
-                disconnected_sources.append(source)
+            if self._connections_by_source.get(source) is not websocket:
+                continue
+            self._connections_by_source.pop(source, None)
+            self._send_locks.pop(source, None)
+            disconnected_sources.append(source)
         return sorted(disconnected_sources)
 
     def _notify_source_disconnected(self, source: str) -> None:
@@ -143,6 +229,22 @@ def _peer_name(peer) -> str | None:
     if isinstance(peer, tuple):
         return ":".join(str(part) for part in peer)
     return str(peer)
+
+
+def _normalize_endpoint_path(value: str) -> str:
+    path = str(value).strip() or DEFAULT_ENDPOINT_PATH
+    return path if path.startswith("/") else f"/{path}"
+
+
+def _websocket_request_path(websocket) -> str | None:
+    request = getattr(websocket, "request", None)
+    path = getattr(request, "path", None)
+    return str(path) if path is not None else None
+
+
+def _normalize_source(value: str) -> str | None:
+    compact = str(value).strip().replace("-", ":").upper()
+    return compact if _MAC_RE.fullmatch(compact) else None
 
 
 async def log_event(event: ArubaBleEvent) -> None:

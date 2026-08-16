@@ -42,3 +42,15 @@ def test_diagnostics_redacts_access_token():
         assert result["runtime"]["receiver_connected_sources"] == ["aa:bb:cc:dd:ee:ff"]
 
     asyncio.run(run_test())
+
+
+def test_diagnostics_redacts_access_token_from_options_too():
+    class Entry(_FakeEntry):
+        options = {CONF_ACCESS_TOKEN: "legacy-secret"}
+
+    async def run_test():
+        result = await async_get_config_entry_diagnostics(None, Entry())
+
+        assert result["options"][CONF_ACCESS_TOKEN] == "***redacted***"
+
+    asyncio.run(run_test())

@@ -22,6 +22,7 @@ def main() -> None:
         host=args.host,
         port=args.port,
         access_token=args.access_token,
+        endpoint_path=args.endpoint_path,
         event_handler=SummaryEventLogger() if args.summary else None,
     )
     try:
@@ -41,6 +42,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--access-token",
         default=os.environ.get("ARUBA_BLE_PROXY_ACCESS_TOKEN") or None,
+    )
+    parser.add_argument(
+        "--endpoint-path",
+        default=os.environ.get("ARUBA_BLE_PROXY_ENDPOINT_PATH", "/aruba-ble-proxy"),
     )
     parser.add_argument(
         "--log-level",

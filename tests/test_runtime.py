@@ -1,5 +1,7 @@
 import asyncio
 
+import pytest
+
 from custom_components.aruba_ble_proxy.active import (
     ACTION_BLE_CONNECT,
     ACTION_BLE_DISCONNECT,
@@ -320,6 +322,69 @@ def test_runtime_falls_back_when_remote_scanner_registration_fails(monkeypatch):
     assert runtime.stats.bluetooth_forward_errors == 1
     assert runtime.stats.bluetooth_forwards == 1
     assert runtime.stats.last_bluetooth_error is None
+
+
+def test_runtime_rolls_back_partial_scanner_registration(monkeypatch):
+    runtime = ArubaBleProxyRuntime(
+        hass=None,
+        host="0.0.0.0",
+        port=7443,
+        access_token="secret",
+    )
+    cleanup_calls = []
+
+    class RemoteScanner:
+        scanner = object()
+        connectable = True
+
+        def __init__(self, source, runtime, connectable):
+            pass
+
+        def async_setup(self):
+            raise RuntimeError("setup failed")
+
+    monkeypatch.setattr(
+        "custom_components.aruba_ble_proxy.scanner.ArubaBleRemoteScanner",
+        RemoteScanner,
+    )
+    runtime._register_scanner = lambda *args, **kwargs: (
+        lambda: cleanup_calls.append("registration")
+    )
+
+    with pytest.raises(RuntimeError, match="setup failed"):
+        runtime._create_remote_scanner("02:00:00:00:00:01")
+
+    assert cleanup_calls == ["registration"]
+    assert runtime._remote_scanners == {}
+    assert runtime._scanner_unsubs == {}
+
+
+def test_runtime_unregisters_all_scanners_when_one_callback_fails():
+    runtime = ArubaBleProxyRuntime(
+        hass=None,
+        host="0.0.0.0",
+        port=7443,
+        access_token="secret",
+    )
+    cleanup_calls = []
+
+    def fail_cleanup():
+        cleanup_calls.append("failed")
+        raise RuntimeError("cleanup failed")
+
+    runtime._scanner_unsubs = {
+        "02:00:00:00:00:01": [lambda: cleanup_calls.append("first"), fail_cleanup],
+        "02:00:00:00:00:02": [lambda: cleanup_calls.append("second")],
+    }
+    runtime._remote_scanners = {"first": object(), "second": object()}
+    runtime.stats.active_connectable_scanners = 2
+
+    runtime._unregister_scanners()
+
+    assert cleanup_calls == ["failed", "first", "second"]
+    assert runtime._scanner_unsubs == {}
+    assert runtime._remote_scanners == {}
+    assert runtime.stats.active_connectable_scanners == 0
 
 
 def test_runtime_sends_active_action_and_waits_for_result():
@@ -2589,6 +2654,23 @@ def test_runtime_tracks_action_result_timeout_diagnostics(monkeypatch):
         assert runtime.diagnostic_attributes()["active_operation_locks"] == 0
 
     asyncio.run(run_test())
+
+
+def test_runtime_bounds_cancelled_action_ids(monkeypatch):
+    runtime = ArubaBleProxyRuntime(
+        hass=None,
+        host="0.0.0.0",
+        port=7443,
+        access_token="secret",
+    )
+    monkeypatch.setattr(runtime_module, "CANCELLED_ACTION_IDS_LIMIT", 2)
+
+    runtime._remember_cancelled_action_id("first")
+    runtime._remember_cancelled_action_id("second")
+    runtime._remember_cancelled_action_id("third")
+
+    assert len(runtime._cancelled_action_ids) == 2
+    assert "third" in runtime._cancelled_action_ids
 
 
 def test_runtime_cleans_pending_action_when_cancelled():
