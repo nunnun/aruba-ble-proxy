@@ -85,9 +85,18 @@ def uuid_to_bytes(value: str | None) -> bytes:
         return b""
     cleaned = value.strip().replace("-", "")
     if len(cleaned) == 4:
-        cleaned = f"0000{cleaned}00001000800000805f9b34fb"
+        return bytes.fromhex(cleaned)
     if len(cleaned) != 32:
         raise ValueError(f"Invalid BLE UUID: {value}")
+    # Aruba AOS matches Bluetooth SIG UUIDs by their native 16-bit wire form.
+    # Bleak commonly supplies the equivalent 128-bit Bluetooth Base UUID, so
+    # compress that representation before sending a southbound action. Custom
+    # 128-bit UUIDs must remain 16 bytes.
+    if (
+        cleaned.startswith("0000")
+        and cleaned[8:] == "00001000800000805f9b34fb"
+    ):
+        return bytes.fromhex(cleaned[4:8])
     return bytes.fromhex(cleaned)
 
 

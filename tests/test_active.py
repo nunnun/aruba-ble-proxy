@@ -71,8 +71,19 @@ def test_encode_gatt_read_accepts_short_uuid():
     message.ParseFromString(payload)
 
     assert message.actions[0].type == aruba_iot_types_pb2.gattRead
-    assert message.actions[0].serviceUuid == uuid_to_bytes("0000180f-0000-1000-8000-00805f9b34fb")
-    assert message.actions[0].characteristicUuid == uuid_to_bytes("00002a19-0000-1000-8000-00805f9b34fb")
+    assert message.actions[0].serviceUuid == bytes.fromhex("180f")
+    assert message.actions[0].characteristicUuid == bytes.fromhex("2a19")
+
+
+def test_uuid_to_bytes_compresses_bluetooth_base_uuid_only():
+    """Native SIG UUIDs are short; vendor-specific UUIDs stay 128-bit."""
+    assert uuid_to_bytes("180f") == bytes.fromhex("180f")
+    assert uuid_to_bytes("0000180f-0000-1000-8000-00805f9b34fb") == bytes.fromhex(
+        "180f"
+    )
+    assert uuid_to_bytes("12345678-1234-5678-1234-567812345678") == bytes.fromhex(
+        "12345678123456781234567812345678"
+    )
 
 
 def test_encode_gatt_notification_carries_enable_value():
