@@ -484,6 +484,15 @@ class ArubaBleProxyRuntime:
         self.stats.last_active_characteristic_service = key[2] if key else None
         self.stats.last_active_characteristic_uuid = characteristic_uuid
         self.stats.last_active_characteristic_value = characteristic.value.hex()
+        _LOGGER.debug(
+            "Aruba BLE characteristic discovered source=%s device=%s service=%s "
+            "characteristic=%s properties=%s",
+            source,
+            device_mac,
+            characteristic.service_uuid,
+            characteristic.characteristic_uuid,
+            characteristic.properties,
+        )
         futures = []
         if key is not None:
             if len(self._last_characteristics) >= self._max_last_characteristics:
