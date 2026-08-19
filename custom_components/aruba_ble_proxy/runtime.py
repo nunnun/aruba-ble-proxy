@@ -307,10 +307,38 @@ class ArubaBleProxyRuntime:
                 "Aruba BLE Proxy receiver",
             )
         self._task.add_done_callback(self._handle_receiver_task_done)
+        await self._async_register_configured_source_scanners()
         await asyncio.sleep(0)
         if self._task.done():
             self._task.result()
         self._notify_listeners()
+
+    async def _async_register_configured_source_scanners(self) -> None:
+        """Register persisted AP scanners before dependent integrations start."""
+        if self.hass is None or self._entry_id is None:
+            return
+        entries_getter = getattr(self.hass.config_entries, "async_entries", None)
+        if entries_getter is None:
+            return
+        for entry in entries_getter(DOMAIN):
+            data = getattr(entry, "data", {})
+            if data.get(CONF_ENTRY_TYPE) != ENTRY_TYPE_AP_SOURCE:
+                continue
+            if data.get(CONF_PARENT_ENTRY_ID) != self._entry_id:
+                continue
+            source = data.get(CONF_AP_SOURCE)
+            if not source:
+                continue
+            normalized_source = _normalize_mac(str(source)) or str(source).upper()
+            if normalized_source in self._remote_scanners:
+                continue
+            try:
+                await self._async_create_remote_scanner(normalized_source)
+            except Exception:
+                _LOGGER.exception(
+                    "Failed to register configured Aruba AP scanner %s",
+                    normalized_source,
+                )
 
     def _handle_receiver_task_done(self, task: asyncio.Task) -> None:
         if task.cancelled():
