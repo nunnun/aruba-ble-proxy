@@ -1448,7 +1448,7 @@ class ArubaBleProxyRuntime:
         device_mac: str,
         *,
         source: str | None = None,
-        timeout: float = 3.0,
+        timeout: float = 8.0,
     ) -> list[ArubaCharacteristic]:
         started_at = monotonic()
         existing = self.characteristics_for_device(device_mac, source=source)
