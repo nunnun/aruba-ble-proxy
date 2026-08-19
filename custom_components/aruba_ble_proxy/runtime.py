@@ -49,6 +49,7 @@ DISCONNECT_SUCCESS_STATUSES = {
 }
 
 PASSIVE_SENSOR_UPDATE_INTERVAL = 30.0
+DEVICE_CHARACTERISTIC_SETTLE_DELAY = 0.1
 RUNTIME_STATS_SET_LIMIT = 2048
 DEVICE_ADVERTISED_SERVICE_UUIDS_LIMIT = 4096
 CANCELLED_ACTION_IDS_LIMIT = 4096
@@ -258,6 +259,9 @@ class ArubaBleProxyRuntime:
         ] = {}
         self._pending_device_characteristics: dict[
             tuple[str | None, str], list[asyncio.Future]
+        ] = {}
+        self._pending_device_characteristic_resolutions: dict[
+            tuple[str | None, str], asyncio.TimerHandle
         ] = {}
         self._last_characteristics: dict[
             tuple[str, str, str, str], ArubaCharacteristic
@@ -502,16 +506,7 @@ class ArubaBleProxyRuntime:
         for future in futures:
             if not future.done():
                 future.set_result(characteristic)
-        device_futures = [
-            *self._pending_device_characteristics.pop((source, device_mac), []),
-            *self._pending_device_characteristics.pop((None, device_mac), []),
-        ]
-        for future in device_futures:
-            if not future.done():
-                future.set_result(
-                    self.characteristics_for_device(device_mac, source=source)
-                    or self.characteristics_for_device(device_mac)
-                )
+        self._schedule_device_characteristic_resolutions(source, device_mac)
         callbacks = self._notification_callbacks_for(
             source,
             device_mac,
@@ -819,13 +814,55 @@ class ArubaBleProxyRuntime:
     def _resolve_device_characteristic_waiters(self, source: str, device_mac: str) -> None:
         normalized_source = _normalize_mac(source) or source.upper()
         normalized = _normalize_mac(device_mac)
-        futures = [
-            *self._pending_device_characteristics.pop((normalized_source, normalized), []),
-            *self._pending_device_characteristics.pop((None, normalized), []),
-        ]
+        for key in ((normalized_source, normalized), (None, normalized)):
+            handle = self._pending_device_characteristic_resolutions.pop(key, None)
+            if handle is not None:
+                handle.cancel()
+            futures = self._pending_device_characteristics.pop(key, [])
+            for future in futures:
+                if not future.done():
+                    future.set_result([])
+
+    def _schedule_device_characteristic_resolutions(
+        self,
+        source: str,
+        device_mac: str,
+    ) -> None:
+        """Resolve discovery waiters after the current characteristic burst settles."""
+        normalized_source = _normalize_mac(source) or source.upper()
+        normalized = _normalize_mac(device_mac)
+        if normalized is None:
+            return
+        for key in ((normalized_source, normalized), (None, normalized)):
+            if key not in self._pending_device_characteristics:
+                continue
+            handle = self._pending_device_characteristic_resolutions.pop(key, None)
+            if handle is not None:
+                handle.cancel()
+            self._pending_device_characteristic_resolutions[key] = (
+                asyncio.get_running_loop().call_later(
+                    DEVICE_CHARACTERISTIC_SETTLE_DELAY,
+                    self._resolve_settled_device_characteristic_waiters,
+                    key,
+                )
+            )
+
+    def _resolve_settled_device_characteristic_waiters(
+        self,
+        key: tuple[str | None, str],
+    ) -> None:
+        """Return the complete characteristic burst to discovery callers."""
+        self._pending_device_characteristic_resolutions.pop(key, None)
+        source, device_mac = key
+        futures = self._pending_device_characteristics.pop(key, [])
+        if not futures:
+            return
+        characteristics = self.characteristics_for_device(device_mac, source=source)
+        if not characteristics and source is not None:
+            characteristics = self.characteristics_for_device(device_mac)
         for future in futures:
             if not future.done():
-                future.set_result([])
+                future.set_result(characteristics)
 
     def _notify_device_disconnect_listeners(
         self,

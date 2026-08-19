@@ -2080,6 +2080,59 @@ def test_runtime_waits_for_device_characteristics():
     asyncio.run(run_test())
 
 
+def test_runtime_waits_for_complete_characteristic_burst():
+    async def run_test():
+        runtime = ArubaBleProxyRuntime(
+            hass=None,
+            host="0.0.0.0",
+            port=7443,
+            access_token="secret",
+        )
+        wait_task = asyncio.create_task(
+            runtime.async_wait_for_device_characteristics(
+                "02:00:00:00:01:01",
+                timeout=1,
+            )
+        )
+        await asyncio.sleep(0)
+
+        reporter = _event().reporter
+        await runtime._async_handle_message(
+            ArubaTelemetryMessage(
+                reporter=reporter,
+                events=[],
+                action_results=[],
+                characteristics=[
+                    ArubaCharacteristic(
+                        reporter=reporter,
+                        device_mac="02:00:00:00:01:01",
+                        service_uuid="0000ffd0-0000-1000-8000-00805f9b34fb",
+                        characteristic_uuid=characteristic_uuid,
+                        value=b"",
+                        description=None,
+                        properties=properties,
+                    )
+                    for characteristic_uuid, properties in (
+                        ("0000ffd1-0000-1000-8000-00805f9b34fb", ("write",)),
+                        ("0000ffd2-0000-1000-8000-00805f9b34fb", ("notify",)),
+                    )
+                ],
+                statuses=[],
+            )
+        )
+
+        characteristics = await wait_task
+        assert {
+            characteristic.characteristic_uuid
+            for characteristic in characteristics
+        } == {
+            "0000ffd1-0000-1000-8000-00805f9b34fb",
+            "0000ffd2-0000-1000-8000-00805f9b34fb",
+        }
+
+    asyncio.run(run_test())
+
+
 def test_runtime_device_characteristics_wait_times_out_cleanly():
     async def run_test():
         runtime = ArubaBleProxyRuntime(
