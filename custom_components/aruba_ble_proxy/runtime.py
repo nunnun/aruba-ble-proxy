@@ -38,6 +38,7 @@ _LOGGER = logging.getLogger(__name__)
 DISCONNECTED_DEVICE_STATUSES = {
     "deviceDisconnected",
     "inactivityTimeout",
+    "notConnected",
     "sourceDisconnected",
 }
 
@@ -212,6 +213,12 @@ class _CharacteristicWaitFailed(Exception):
 
 
 class ArubaBleProxyRuntime:
+    # Aruba AOS can drop a southbound BLE session when notification is
+    # disabled immediately before the next GATT operation.  Keep the AP
+    # subscription alive briefly so a caller that re-subscribes as part of a
+    # normal request/response exchange does not cause an enable/disable flap.
+    NOTIFICATION_DISABLE_GRACE_SECONDS = 2.0
+
     def __init__(
         self,
         *,
@@ -276,6 +283,11 @@ class ArubaBleProxyRuntime:
             list[Callable[[ArubaCharacteristic], None]],
         ] = {}
         self._notification_services_by_char: dict[tuple[str, str, str], set[str]] = {}
+        self._notification_enabled_keys: set[tuple[str, str, str, str]] = set()
+        self._pending_notification_disables: dict[
+            tuple[str, str, str, str], asyncio.TimerHandle
+        ] = {}
+        self._deferred_notification_disable_tasks: set[asyncio.Task[Any]] = set()
         self._last_passive_listener_update = 0.0
 
     async def async_start(self, entry: Any | None = None) -> None:
@@ -324,6 +336,7 @@ class ArubaBleProxyRuntime:
         self._notify_listeners()
 
     async def async_stop(self) -> None:
+        await self._async_cancel_deferred_notification_disables()
         await self._async_disconnect_active_devices_on_stop()
         self._unregister_scanners()
         if self._task is None:
@@ -334,6 +347,19 @@ class ArubaBleProxyRuntime:
         except asyncio.CancelledError:
             pass
         self._task = None
+
+    async def _async_cancel_deferred_notification_disables(self) -> None:
+        """Cancel notification-disable work that must not outlive the runtime."""
+        for handle in self._pending_notification_disables.values():
+            handle.cancel()
+        self._pending_notification_disables.clear()
+        self._notification_enabled_keys.clear()
+
+        tasks = list(self._deferred_notification_disable_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _async_disconnect_active_devices_on_stop(self) -> None:
         active_keys = sorted(
@@ -448,6 +474,7 @@ class ArubaBleProxyRuntime:
                         result.status_name,
                         result.status_string,
                     )
+                self._handle_failed_disconnect_result(result, context)
                 continue
             if _is_successful_action_result(result, context):
                 self.stats.last_active_action_error = None
@@ -458,10 +485,44 @@ class ArubaBleProxyRuntime:
                     result.status_name,
                     result.status_string,
                 )
+                self._handle_failed_disconnect_result(result, context)
             if future is not None and not future.done():
                 future.set_result(result)
         if message.action_results or message.characteristics or message.statuses:
             self._notify_listeners()
+
+    def _handle_failed_disconnect_result(
+        self,
+        result: ArubaActionResult,
+        context: _PendingActionContext | None,
+    ) -> None:
+        """Release a slot when Aruba reports a failed action on a lost link.
+
+        A GATT action can be the first indication that an AP-side BLE session
+        disappeared. Aruba reports that condition as ``notConnected`` instead
+        of sending a separate device status update. Keeping the device marked
+        active would permanently consume one of the AP's connection slots.
+        """
+        if result.status_name not in DISCONNECTED_DEVICE_STATUSES:
+            return
+        if _is_successful_action_result(result, context):
+            return
+        device_mac = result.device_mac or (context.device_mac if context else None)
+        source = context.ap_mac if context is not None else result.source
+        if not device_mac or not source:
+            return
+        self.stats.active_disconnect_statuses += 1
+        self._mark_device_disconnected(
+            _device_key(source, device_mac),
+            ArubaStatusUpdate(
+                reporter=result.reporter,
+                device_mac=device_mac,
+                status=int(result.status),
+                status_name=result.status_name,
+                status_string=result.status_string,
+                mtu=None,
+            ),
+        )
 
     def _handle_characteristic(self, characteristic: ArubaCharacteristic) -> None:
         source = _normalize_mac(characteristic.source)
@@ -789,6 +850,14 @@ class ArubaBleProxyRuntime:
             )
             self._notification_callbacks.pop(key, None)
             self._untrack_notification_service(key)
+        for key, handle in list(self._pending_notification_disables.items()):
+            if key[0] == normalized_source and key[1] == normalized:
+                handle.cancel()
+                self._pending_notification_disables.pop(key, None)
+                self._notification_enabled_keys.discard(key)
+        for key in list(self._notification_enabled_keys):
+            if key[0] == normalized_source and key[1] == normalized:
+                self._notification_enabled_keys.discard(key)
 
     def _forget_device_characteristics(self, source: str, device_mac: str) -> None:
         normalized_source = _normalize_mac(source) or source.upper()
@@ -1159,6 +1228,9 @@ class ArubaBleProxyRuntime:
         async with self._active_operation(
             ap_mac, device_mac, action_type=ACTION_GATT_NOTIFICATION
         ):
+            pending_disable = self._pending_notification_disables.pop(key, None)
+            if pending_disable is not None:
+                pending_disable.cancel()
             callbacks = self._notification_callbacks.get(key, [])
             if callback in callbacks:
                 return {
@@ -1171,6 +1243,18 @@ class ArubaBleProxyRuntime:
                 }
             if callbacks:
                 callbacks.append(callback)
+                self.stats.active_notifications_enabled += 1
+                return {
+                    "sent": False,
+                    "status": "already_enabled",
+                    "source": key[0],
+                    "device_mac": key[1],
+                    "service_uuid": key[2],
+                    "characteristic_uuid": key[3],
+                }
+            if key in self._notification_enabled_keys:
+                self._notification_callbacks[key] = [callback]
+                self._track_notification_service(key)
                 self.stats.active_notifications_enabled += 1
                 return {
                     "sent": False,
@@ -1193,6 +1277,7 @@ class ArubaBleProxyRuntime:
             if result.get("status") == "success":
                 self._notification_callbacks[key] = [callback]
                 self._track_notification_service(key)
+                self._notification_enabled_keys.add(key)
                 self.stats.active_notifications_enabled += 1
             return response
 
@@ -1261,25 +1346,96 @@ class ArubaBleProxyRuntime:
                     "service_uuid": key[2],
                     "characteristic_uuid": key[3],
                 }
-            response = await self._async_gatt_notification_unlocked(
-                ap_mac=ap_mac,
-                device_mac=device_mac,
-                service_uuid=key[2],
-                characteristic_uuid=key[3],
-                enable=False,
-                timeout=timeout,
-                wait_result=True,
+            callbacks.remove(callback)
+            self.stats.active_notifications_enabled = max(
+                0,
+                self.stats.active_notifications_enabled - 1,
             )
-            result = response.get("result", {})
-            if result.get("status") == "success":
-                callbacks.remove(callback)
-                self.stats.active_notifications_enabled = max(
-                    0,
-                    self.stats.active_notifications_enabled - 1,
+            self._notification_callbacks.pop(key, None)
+            self._untrack_notification_service(key)
+            if key not in self._notification_enabled_keys:
+                return {
+                    "sent": False,
+                    "status": "not_enabled",
+                    "source": key[0],
+                    "device_mac": key[1],
+                    "service_uuid": key[2],
+                    "characteristic_uuid": key[3],
+                }
+            self._schedule_notification_disable(key, timeout)
+            return {
+                "sent": False,
+                "status": "deferred_disable",
+                "source": key[0],
+                "device_mac": key[1],
+                "service_uuid": key[2],
+                "characteristic_uuid": key[3],
+            }
+
+    def _schedule_notification_disable(
+        self,
+        key: tuple[str, str, str, str],
+        timeout: int,
+    ) -> None:
+        previous = self._pending_notification_disables.pop(key, None)
+        if previous is not None:
+            previous.cancel()
+        loop = asyncio.get_running_loop()
+        self._pending_notification_disables[key] = loop.call_later(
+            self.NOTIFICATION_DISABLE_GRACE_SECONDS,
+            self._start_deferred_notification_disable,
+            key,
+            timeout,
+        )
+
+    def _start_deferred_notification_disable(
+        self,
+        key: tuple[str, str, str, str],
+        timeout: int,
+    ) -> None:
+        task = asyncio.create_task(
+            self._async_deferred_notification_disable(key, timeout)
+        )
+        self._deferred_notification_disable_tasks.add(task)
+        task.add_done_callback(self._deferred_notification_disable_tasks.discard)
+
+    async def _async_deferred_notification_disable(
+        self,
+        key: tuple[str, str, str, str],
+        timeout: int,
+    ) -> None:
+        self._pending_notification_disables.pop(key, None)
+        if self._notification_callbacks.get(key):
+            return
+        if key not in self._notification_enabled_keys:
+            return
+        try:
+            async with self._active_operation(
+                key[0], key[1], action_type=ACTION_GATT_NOTIFICATION
+            ):
+                if self._notification_callbacks.get(key):
+                    return
+                if key not in self._notification_enabled_keys:
+                    return
+                response = await self._async_gatt_notification_unlocked(
+                    ap_mac=key[0],
+                    device_mac=key[1],
+                    service_uuid=key[2],
+                    characteristic_uuid=key[3],
+                    enable=False,
+                    timeout=timeout,
+                    wait_result=True,
                 )
-                self._notification_callbacks.pop(key, None)
-                self._untrack_notification_service(key)
-            return response
+            result = response.get("result", {})
+            if result.get("status") != "success":
+                _LOGGER.debug(
+                    "Deferred Aruba GATT notification disable failed: %s", response
+                )
+        except Exception:
+            _LOGGER.debug("Deferred Aruba GATT notification disable failed", exc_info=True)
+        finally:
+            if not self._notification_callbacks.get(key):
+                self._notification_enabled_keys.discard(key)
 
     def forget_gatt_notify_callback(
         self,
@@ -1326,6 +1482,10 @@ class ArubaBleProxyRuntime:
             if not callbacks:
                 self._notification_callbacks.pop(key, None)
                 self._untrack_notification_service(key)
+                pending_disable = self._pending_notification_disables.pop(key, None)
+                if pending_disable is not None:
+                    pending_disable.cancel()
+                self._notification_enabled_keys.discard(key)
             removed = True
         return removed
 

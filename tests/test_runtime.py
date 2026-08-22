@@ -2219,6 +2219,10 @@ def test_runtime_gatt_notification_invokes_callback_and_stops():
             )
         )
         await asyncio.sleep(0)
+        runtime.NOTIFICATION_DISABLE_GRACE_SECONDS = 0.01
+        stop_response = await stop_task
+        assert stop_response["status"] == "deferred_disable"
+        await asyncio.sleep(0.02)
         await runtime._async_handle_message(
             ArubaTelemetryMessage(
                 reporter=_event().reporter,
@@ -2239,8 +2243,7 @@ def test_runtime_gatt_notification_invokes_callback_and_stops():
             )
         )
 
-        stop_response = await stop_task
-        assert stop_response["result"]["status"] == "success"
+        await asyncio.sleep(0)
         assert runtime.stats.active_notifications_enabled == 0
         assert runtime.diagnostic_attributes()["active_notification_subscriptions"] == []
 
@@ -2513,7 +2516,7 @@ def test_runtime_dispatches_notifications_to_multiple_service_uuid_registrations
     asyncio.run(run_test())
 
 
-def test_runtime_stop_notify_keeps_callback_when_disable_fails():
+def test_runtime_stop_notify_removes_callback_when_deferred_disable_fails():
     async def run_test():
         class Receiver:
             def __init__(self):
@@ -2545,6 +2548,7 @@ def test_runtime_stop_notify_keeps_callback_when_disable_fails():
             access_token="secret",
         )
         runtime._receiver = Receiver()
+        runtime.NOTIFICATION_DISABLE_GRACE_SECONDS = 0.01
 
         def callback(characteristic):
             return None
@@ -2557,6 +2561,7 @@ def test_runtime_stop_notify_keeps_callback_when_disable_fails():
         )
         runtime._notification_callbacks[key] = [callback]
         runtime._track_notification_service(key)
+        runtime._notification_enabled_keys.add(key)
         runtime.stats.active_notifications_enabled = 1
 
         stop_task = asyncio.create_task(
@@ -2569,6 +2574,9 @@ def test_runtime_stop_notify_keeps_callback_when_disable_fails():
             )
         )
         await asyncio.sleep(0)
+        response = await stop_task
+        assert response["status"] == "deferred_disable"
+        await asyncio.sleep(0.02)
         await runtime._async_handle_message(
             ArubaTelemetryMessage(
                 reporter=_event().reporter,
@@ -2589,10 +2597,9 @@ def test_runtime_stop_notify_keeps_callback_when_disable_fails():
             )
         )
 
-        response = await stop_task
-        assert response["result"]["status"] == "gattError"
-        assert runtime._notification_callbacks[key] == [callback]
-        assert runtime.stats.active_notifications_enabled == 1
+        await asyncio.sleep(0)
+        assert key not in runtime._notification_callbacks
+        assert runtime.stats.active_notifications_enabled == 0
         assert runtime.stats.active_action_failures == 1
         assert runtime.stats.last_active_action_error == "gattError: failed"
 
@@ -4142,6 +4149,7 @@ def test_runtime_notify_reference_counts_callbacks():
         assert len(receiver.payloads) == 1
         assert runtime.stats.active_notifications_enabled == 1
 
+        runtime.NOTIFICATION_DISABLE_GRACE_SECONDS = 0.01
         final_stop_task = asyncio.create_task(
             runtime.async_stop_gatt_notify(
                 ap_mac="02:00:00:00:00:01",
@@ -4152,6 +4160,10 @@ def test_runtime_notify_reference_counts_callbacks():
             )
         )
         await asyncio.sleep(0)
+        final_stop = await final_stop_task
+        assert final_stop["status"] == "deferred_disable"
+        assert len(receiver.payloads) == 1
+        await asyncio.sleep(0.02)
         assert len(receiver.payloads) == 2
         await runtime._async_handle_message(
             ArubaTelemetryMessage(
@@ -4172,9 +4184,36 @@ def test_runtime_notify_reference_counts_callbacks():
                 characteristics=[],
             )
         )
-        final_stop = await final_stop_task
-        assert final_stop["result"]["status"] == "success"
+        await asyncio.sleep(0)
         assert runtime.stats.active_notifications_enabled == 0
+
+    asyncio.run(run_test())
+
+
+def test_runtime_stop_cancels_deferred_notification_disable():
+    async def run_test():
+        runtime = ArubaBleProxyRuntime(
+            hass=None,
+            host="0.0.0.0",
+            port=7443,
+            access_token="secret",
+        )
+        runtime.NOTIFICATION_DISABLE_GRACE_SECONDS = 0.01
+        key = (
+            "02:00:00:00:00:01",
+            "02:00:00:00:01:01",
+            "0000180f-0000-1000-8000-00805f9b34fb",
+            "00002a19-0000-1000-8000-00805f9b34fb",
+        )
+        runtime._notification_enabled_keys.add(key)
+        runtime._schedule_notification_disable(key, timeout=20)
+
+        await runtime.async_stop()
+        await asyncio.sleep(0.02)
+
+        assert runtime._pending_notification_disables == {}
+        assert runtime._deferred_notification_disable_tasks == set()
+        assert key not in runtime._notification_enabled_keys
 
     asyncio.run(run_test())
 
@@ -4352,3 +4391,46 @@ def test_runtime_normalizes_sources_for_connected_lookup_and_disconnect():
             "status": "sourceDisconnected",
         }
     ]
+
+
+def test_runtime_failed_gatt_action_releases_slot_after_not_connected():
+    async def run_test():
+        class Receiver:
+            def connected_sources(self):
+                return ["02:00:00:00:00:01"]
+
+        runtime = ArubaBleProxyRuntime(
+            hass=None,
+            host="0.0.0.0",
+            port=7443,
+            access_token="secret",
+        )
+        runtime._receiver = Receiver()
+        key = ("02:00:00:00:00:01", "02:00:00:00:01:01")
+        runtime._active_device_keys_by_source[key[0]] = {key}
+
+        await runtime._async_handle_message(
+            ArubaTelemetryMessage(
+                reporter=_event().reporter,
+                events=[],
+                action_results=[
+                    ArubaActionResult(
+                        reporter=_event().reporter,
+                        action_id="notify-lost-link",
+                        action_type=ACTION_GATT_NOTIFICATION,
+                        device_mac=key[1],
+                        status=ArubaActionStatus.NOT_CONNECTED,
+                        status_name="notConnected",
+                        status_string="device link is gone",
+                        apb_mac=None,
+                    )
+                ],
+                characteristics=[],
+            )
+        )
+
+        assert runtime.active_devices_for_source(key[0]) == []
+        assert runtime.can_connect_source(key[0]) is True
+        assert runtime._device_connection_statuses[key] == "notConnected"
+
+    asyncio.run(run_test())

@@ -31,6 +31,8 @@ LOCAL_SUCCESS_STATUSES = {
     "already_registered",
     "already_enabled",
     "callbacks_remaining",
+    "deferred_disable",
+    "not_enabled",
 }
 CONNECT_SUCCESS_STATUSES = {"alreadyConnected"}
 DISCONNECT_SUCCESS_STATUSES = {
